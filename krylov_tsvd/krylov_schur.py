@@ -1,5 +1,13 @@
+"""Restarted Krylov-Schur iteration for dense real or complex matrices.
+
+The public routine returns (Q, H, isC, flag, nc, ni). Its retained subspace is
+Q[:, :-1], with the final column carrying the Arnoldi residual. The original
+real-Schur block helpers remain available; complex Schur ordering uses LAPACK.
+"""
+
 import numpy as np
 from scipy.linalg import schur, eigvals
+from scipy.linalg.lapack import get_lapack_funcs
 
 expensive_asserts = True
 
@@ -291,7 +299,7 @@ def truncateKrylov(Q, H, k, m):
 
 
 def testConverge(H, kk, ii, tol):
-    '''
+    r'''
     test the convergence of the ith eigenvalue in Krylov-Schur iteration
     H is the hessenberg matrix after truncation
     The test rule is 
@@ -315,30 +323,18 @@ def testConverge(H, kk, ii, tol):
                     1 : real eigenvalue converges
                     2 : complex eigenvalue pair converges
     ''' 
-    i = ii-1
-
-    k = kk-1
-    epsilon = 2e-16
-    
-    if i < k:
-        delta = (H[i, i]-H[i+1, i+1])**2+4*H[i+1, i]*H[i, i+1]
-    else:
-        delta = 1
-
-    if delta > 0:
-        if np.abs(H[k+1, i]) < np.max([np.linalg.norm(H, 'fro')*epsilon , np.abs(H[i, i]*tol)]):
-            flag = 1
-        else:
-            flag = -1
-    else:
-        gamma = complex(H[i, i] + H[i+1, i+1], np.sqrt(-delta))/2
-
-        if np.abs(H[k+1, i]) < np.max([np.linalg.norm(H, 'fro') * epsilon, np.abs(gamma) * tol]):
-            flag = 2
-        else:
-            flag = -1
-
-    return flag
+    # This helper retains its original one-based eigenvalue index. The caller
+    # counts converged values from zero and must therefore pass p + 1.
+    i = ii - 1
+    epsilon = np.finfo(H.real.dtype).eps
+    scale = np.linalg.norm(H[:kk, :kk], 'fro')
+    block_size = 1
+    if i + 1 < kk and np.abs(H[i + 1, i]) > 100 * epsilon * scale:
+        block_size = 2
+    eigenvalues = eigvals(H[i:i + block_size, i:i + block_size])
+    threshold = max(epsilon * scale, tol * np.max(np.abs(eigenvalues)))
+    residual = np.linalg.norm(H[kk, i:i + block_size])
+    return block_size if residual <= threshold else -1
 
 
 def sortSchur(A, kk):
@@ -359,6 +355,19 @@ def sortSchur(A, kk):
         magnitudes. You can change this functions accordingly to obtain
         eigenvalues that you need.
     """
+    # Complex Schur vectors are unitary. The real-block swap helpers below use
+    # plain transposes, so they cannot safely reorder complex Fourier slices.
+    if np.iscomplexobj(A):
+        T, U = schur(A, output='complex')
+        reorder = get_lapack_funcs('trexc', (T,))
+        for position in range(kk):
+            source = position + np.argmax(np.abs(np.diag(T)[position:]))
+            if source != position:
+                T, U, info = reorder(T, U, int(source + 1), position + 1)
+                if info != 0:
+                    raise np.linalg.LinAlgError('Complex Schur reordering failed')
+        return U, T, 0
+
     k = kk-1
     T, U = schur(A, 'real')
     es = eigvals(T)
@@ -380,6 +389,21 @@ def Ax(A, x):
     return A.dot(x)
 
 
+def _orthogonal_completion(basis):
+    """Continue with a deterministic orthogonal vector after Arnoldi breakdown."""
+    for index in range(basis.shape[0]):
+        vector = np.zeros((basis.shape[0], 1), dtype=basis.dtype)
+        vector[index, 0] = 1
+        for _ in range(2):
+            vector -= basis @ (basis.conj().T @ vector)
+        length = np.linalg.norm(vector)
+        if length > 10 * np.finfo(basis.real.dtype).eps:
+            return vector / length
+    # Once the entire space is spanned, the trailing residual is zero and this
+    # vector is unused. Keeping it zero preserves A @ Q = Q_extended @ H.
+    return np.zeros((basis.shape[0], 1), dtype=basis.dtype)
+
+
 def expandKrylov(A, Q, H, skk, ekk):
 
     """
@@ -397,15 +421,22 @@ def expandKrylov(A, Q, H, skk, ekk):
     ek = ekk-1
     for k in range(sk+1, ek+1):
         v = Ax(A, Q[:, k:k+1])
-        w = Q[:, :k+1].T.dot(v)
+        initial_length = np.linalg.norm(v)
+        w = Q[:, :k+1].conj().T.dot(v)
         v = v-Q[:, :k+1].dot(w)
-        w2 = Q[:, :k+1].T.dot(v)
+        w2 = Q[:, :k+1].conj().T.dot(v)
         v = v-Q[:, :k+1].dot(w2)
         w = w+w2
         nv = np.linalg.norm(v)
-        if Q.shape[1] <= k+2:
+        if Q.shape[1] < k+2:
             Q = np.concatenate((Q, np.zeros((Q.shape[0], 1))), 1)
-        Q[:, k+1:k+2] = (v/nv)
+        if nv <= 10 * np.finfo(Q.real.dtype).eps * initial_length:
+            # An invariant subspace (including zero/repeated eigenvalues) has
+            # been reached. Dividing by this residual would create NaNs.
+            nv = 0.0
+            Q[:, k+1:k+2] = _orthogonal_completion(Q[:, :k+1])
+        else:
+            Q[:, k+1:k+2] = (v/nv)
         if H.shape[0] < k+2:
             H = np.concatenate((H, np.zeros((H.shape[0], 1))), 1)
             H = np.concatenate((H, np.zeros((1, H.shape[1]))), 0)
@@ -438,42 +469,52 @@ def KrylovSchur(A, v1, n, k, m, maxIt, tol):
         ni        number of iteration used (each whole expansion stage counts 1)
     '''
     
-    Q = np.zeros((n, m+1),dtype = 'complex_')
-    H = np.zeros((m+1, m),dtype = 'complex_')
+    A = np.asarray(A)
+    v1 = np.asarray(v1)
+    if A.shape != (n, n) or v1.shape != (n,):
+        raise ValueError('A must have shape (n, n) and v1 must have shape (n,)')
+    if not all(isinstance(value, (int, np.integer)) for value in (n, k, m, maxIt)):
+        raise ValueError('n, k, m, and maxIt must be integers')
+    if not 1 <= k < m <= n:
+        raise ValueError('Expected 1 <= k < m <= n')
+    if maxIt < 0 or not np.isfinite(tol) or tol < 0:
+        raise ValueError('maxIt and tol must be nonnegative and tol must be finite')
+    if not np.isfinite(A).all() or not np.isfinite(v1).all() or np.linalg.norm(v1) == 0:
+        raise ValueError('A and v1 must be finite, and v1 must be nonzero')
+
+    Q = np.zeros((n, m+1), dtype=np.complex128)
+    H = np.zeros((m+1, m), dtype=np.complex128)
     Q[:, 0] = v1/np.linalg.norm(v1)
     p = 0
     isC = 0
 
     Q, H = expandKrylov(A, Q, H, 0, k)
     i = 0
-    while (i < maxIt) & (p <= k):
+    while i < maxIt and p < k:
         i = i+1
         Q, H = expandKrylov(A, Q, H, k+isC, m)
         U, T, isC = sortSchur(H[p:m, p:m], k-p)
         H[p:m, p:m] = T
-        if p-1 >= 0:
-            H[0:p-1, p:m] = H[0:p-1, p:m].dot(U)
+        if p > 0:
+            H[:p, p:m] = H[:p, p:m].dot(U)
 
         Q[:, p:m] = Q[:, p:m].dot(U)
         H[m, p:m] = H[m, m-1]*(U[-1, :])
         Q, H = truncateKrylov(Q, H, k+isC, m)
-        check = True
-        while check:
-            result = testConverge(H, k+isC, p, tol)
+        while p < k + isC:
+            result = testConverge(H, k+isC, p+1, tol)
             if (result == 1) or (result == 2):
                 p = p+result
-                if p > k:
-                    check = False
             else:
-                check = False
+                break
 
     ni = i
-    if p > k:
+    if p >= k:
         flag = 0
         nc = k+isC
     else:
         flag = 1
-        nc = p-1
+        nc = p
     return Q , H, isC, flag, nc, ni
 
     
